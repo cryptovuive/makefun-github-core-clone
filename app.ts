@@ -22,7 +22,11 @@ type ObjectType = 'blob' | 'tree' | 'commit' | 'tag';
 interface GitObject { type: ObjectType; data: Buffer }
 interface FileValue { sha: string; content: Buffer }
 interface CommitValue { tree: string; parents: string[]; message: string; files: Map<string, FileValue> }
-interface Issue { id: number; number: number; title: string; body: string; state: 'open' | 'closed'; labels: string[]; created: number; comments: Array<{ id: number; body: string }> }
+interface Issue {
+  id: number; number: number; title: string; body: string; state: 'open' | 'closed'; labels: string[];
+  created: number; comments: Array<{ id: number; body: string }>; version: number;
+  cachedJson?: { base: string; version: number; bytes: Buffer };
+}
 interface Pull {
   id: number; number: number; title: string; body: string; head: string; base: string;
   state: 'open' | 'closed'; merged: boolean; mergedAt?: string; mergeSha?: string;
@@ -33,6 +37,7 @@ interface Repo {
   defaultBranch: string; refs: Map<string, string>; objects: Map<string, GitObject>;
   commits: Map<string, CommitValue>; files: Map<string, Map<string, FileValue>>;
   labels: Map<string, { name: string; color: string }>; issues: Map<number, Issue>; pulls: Map<number, Pull>;
+  packCache: Map<string, Buffer>; advertisementCache: Map<string, Buffer>; lsRefsCache: Map<string, Buffer>;
 }
 
 const repos = new Map<string, Repo>();
@@ -97,7 +102,8 @@ function createCommit(repo: Repo, branch: string, files: Map<string, FileValue>,
   const lines = ['tree ' + tree, ...parents.map((p) => 'parent ' + p), 'author ' + author, 'committer ' + author, '', message || 'Update files'];
   const oid = addObject(repo, 'commit', Buffer.from(lines.join('\n') + '\n'));
   repo.commits.set(oid, { tree, parents, message: message || 'Update files', files: cloneFiles(files) });
-  repo.files.set(branch, cloneFiles(files));
+  repo.packCache.clear();
+  repo.advertisementCache.clear(); repo.lsRefsCache.clear();
   repo.refs.set('refs/heads/' + branch, oid);
   logicalTime += 1;
   return oid;
@@ -158,7 +164,7 @@ function makeRepo(owner: string, name: string, body: Record<string, unknown> = {
   const repo: Repo = {
     id: nextRepoId++, owner, name, description: typeof body.description === 'string' ? body.description : '',
     private: body.private !== false, defaultBranch: 'main', refs: new Map(), objects: new Map(), commits: new Map(),
-    files: new Map(), labels: new Map(), issues: new Map(), pulls: new Map(),
+  files: new Map(), labels: new Map(), issues: new Map(), pulls: new Map(), packCache: new Map(), advertisementCache: new Map(), lsRefsCache: new Map(),
   };
   repos.set(repoKey(owner, name), repo);
   return repo;
@@ -178,6 +184,16 @@ function issueJson(repo: Repo, issue: Issue, base = ''): Record<string, unknown>
     comments: issue.comments.length, url: base + '/api/v3/repos/' + repo.owner + '/' + repo.name + '/issues/' + issue.number,
     html_url: base + '/•/' + repo.owner + '/' + repo.name + '/issues/' + issue.number,
   };
+}
+function issueCreateJson(repo: Repo, issue: Issue): Record<string, unknown> {
+  return { number: issue.number, title: issue.title, body: issue.body, state: issue.state, labels: issue.labels.map((name) => ({ name, color: repo.labels.get(name)?.color || 'ededed' })) };
+}
+function issueJsonBytes(repo: Repo, issue: Issue, base: string): Buffer {
+  const cached = issue.cachedJson;
+  if (cached && cached.base === base && cached.version === issue.version) return cached.bytes;
+  const bytes = Buffer.from(JSON.stringify(issueJson(repo, issue, base)) + '\n');
+  issue.cachedJson = { base, version: issue.version, bytes };
+  return bytes;
 }
 function pullJson(repo: Repo, pull: Pull, base = ''): Record<string, unknown> {
   const headSha = repoTip(repo, pull.head);
@@ -231,23 +247,64 @@ function makePack(objects: GitObject[]): Buffer {
   const body = Buffer.concat(pieces);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
-function reachable(repo: Repo, start: string[], maxDepth = Infinity): GitObject[] {
+/**
+ * Walk the object closure of one or more tips.  `maxCommitDepth` is the number
+ * of parent edges allowed from each requested tip (0 means the tip commit and
+ * its tree/blobs only).  A shallow boundary is treated as a client-side
+ * boundary: the boundary commit itself is present, but its parents are not.
+ */
+function reachable(repo: Repo, start: string[], maxCommitDepth = Infinity, shallow = new Set<string>()): GitObject[] {
   const seen = new Set<string>(); const out: GitObject[] = [];
-  const walk = (oid: string, depth: number): void => {
-    if (!oid || oid === ZERO || seen.has(oid) || depth > maxDepth) return;
+  const walk = (oid: string, commitDepth: number): void => {
+    if (!oid || oid === ZERO || seen.has(oid)) return;
     const object = repo.objects.get(oid); if (!object) return; seen.add(oid); out.push(object);
     if (object.type === 'commit') {
       const c = repo.commits.get(oid) || parseCommit(object.data);
-      for (const parent of c.parents) walk(parent, depth + 1);
-      walk(c.tree, depth);
-    } else if (object.type === 'tree') for (const entry of parseTree(object.data)) walk(entry.oid, depth);
+      walk(c.tree, commitDepth);
+      if (!shallow.has(oid) && commitDepth < maxCommitDepth) {
+        for (const parent of c.parents) walk(parent, commitDepth + 1);
+      }
+    } else if (object.type === 'tree') for (const entry of parseTree(object.data)) walk(entry.oid, commitDepth);
     else if (object.type === 'tag') {
       const target = object.data.toString('utf8').match(/^object ([0-9a-f]{40})/m)?.[1];
-      if (target) walk(target, depth);
+      if (target) walk(target, commitDepth);
     }
   };
   for (const oid of start) walk(oid, 0);
   return out;
+}
+
+function packCacheKey(wants: string[], haves: string[], depth: number, shallow: string[]): string {
+  return JSON.stringify({ wants: [...wants].sort(), haves: [...haves].sort(), depth, shallow: [...shallow].sort() });
+}
+
+function packForFetch(repo: Repo, wants: string[], haves: string[], depth: number, shallow: string[]): Buffer {
+  const key = packCacheKey(wants, haves, depth, shallow);
+  const cached = repo.packCache.get(key);
+  if (cached) return cached;
+  const haveObjects = new Set(reachable(repo, haves, Infinity, new Set(shallow)).map((object) => hashObject(object.type, object.data)));
+  const objects = reachable(repo, wants, depth).filter((object) => !haveObjects.has(hashObject(object.type, object.data)));
+  const pack = objects.length ? makePack(objects) : Buffer.alloc(0);
+  repo.packCache.set(key, pack);
+  if (repo.packCache.size > 128) repo.packCache.delete(repo.packCache.keys().next().value as string);
+  return pack;
+}
+
+function firstParent(repo: Repo, oid: string): string | undefined {
+  const object = repo.objects.get(oid);
+  if (!object || object.type !== 'commit') return undefined;
+  const commit = repo.commits.get(oid) || parseCommit(object.data);
+  return commit.parents[0];
+}
+
+function shallowBoundary(repo: Repo, want: string, depth: number): string | undefined {
+  let oid = want;
+  for (let index = 1; index < depth; index += 1) {
+    const parent = firstParent(repo, oid);
+    if (!parent) return oid;
+    oid = parent;
+  }
+  return oid;
 }
 function parsePack(pack: Buffer): Array<{ oid: string; type: ObjectType; data: Buffer }> {
   if (pack.length < 20 || pack.subarray(0, 4).toString() !== 'PACK') return [];
@@ -279,6 +336,7 @@ function parsePktBody(body: Buffer): { lines: Buffer[]; offset: number } {
 function installPack(repo: Repo, pack: Buffer): string[] {
   const written: string[] = [];
   for (const object of parsePack(pack)) { repo.objects.set(object.oid, { type: object.type, data: object.data }); written.push(object.oid); }
+  if (written.length) { repo.packCache.clear(); repo.advertisementCache.clear(); repo.lsRefsCache.clear(); }
   for (const oid of written) {
     const object = repo.objects.get(oid);
     if (object?.type === 'commit') {
@@ -308,11 +366,15 @@ function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType:
   res.writeHead(status, { 'content-type': contentType, 'content-length': String(body.length), 'x-github-request-id': 'MF-' + logicalTime.toString(36) });
   res.end(body);
 }
+function sendJsonBytes(res: ServerResponse, status: number, body: Buffer): void {
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': String(body.length), 'x-github-request-id': 'MF-' + logicalTime.toString(36) });
+  res.end(body);
+}
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []; let size = 0;
-    req.on('data', (chunk: Buffer) => { size += chunk.length; if (size <= 25 * 1024 * 1024) chunks.push(Buffer.from(chunk)); });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('data', (chunk: Buffer) => { size += chunk.length; if (size <= 25 * 1024 * 1024) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); });
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -373,7 +435,7 @@ async function rest(req: IncomingMessage, res: ServerResponse, url: URL): Promis
   if (tail[0] === 'git' && tail[1] === 'refs') {
     if (req.method === 'GET' && tail.length === 2) { sendJson(res, 200, [...repo.refs].map(([ref, sha]) => ({ ref, node_id: globalId('Ref', repo.id), object: { sha, type: 'commit' } }))); return; }
     if (req.method === 'POST' && tail.length === 2) {
-      try { const body = await jsonBody(req); const ref = typeof body.ref === 'string' ? body.ref : ''; const sha = typeof body.sha === 'string' ? body.sha : ''; if (!ref.startsWith('refs/heads/') || !sha || !repo.objects.has(sha)) { sendJson(res, 422, errorBody('Reference does not exist')); return; } if (repo.refs.has(ref)) { sendJson(res, 422, errorBody('Reference already exists')); return; } repo.refs.set(ref, sha); const branch = ref.slice(11); repo.files.set(branch, cloneFiles(hydrateFiles(repo, sha))); sendJson(res, 201, { ref, object: { sha, type: 'commit', url: base + '/api/v3/repos/' + repo.owner + '/' + repo.name + '/git/commits/' + sha } }); }
+      try { const body = await jsonBody(req); const ref = typeof body.ref === 'string' ? body.ref : ''; const sha = typeof body.sha === 'string' ? body.sha : ''; if (!ref.startsWith('refs/heads/') || !sha || !repo.objects.has(sha)) { sendJson(res, 422, errorBody('Reference does not exist')); return; } if (repo.refs.has(ref)) { sendJson(res, 422, errorBody('Reference already exists')); return; } repo.refs.set(ref, sha); sendJson(res, 201, { ref, object: { sha, type: 'commit', url: base + '/api/v3/repos/' + repo.owner + '/' + repo.name + '/git/commits/' + sha } }); }
       catch (err) { sendJson(res, 400, errorBody((err as Error).message)); }
       return;
     }
@@ -408,16 +470,16 @@ async function rest(req: IncomingMessage, res: ServerResponse, url: URL): Promis
   }
   if (tail[0] === 'issues') {
     if (tail.length === 1 && req.method === 'POST') {
-      try { const body = await jsonBody(req); const title = typeof body.title === 'string' ? body.title : ''; const labels = Array.isArray(body.labels) ? body.labels.map((x) => typeof x === 'string' ? x : (x as Record<string, unknown>)?.name).filter((x): x is string => typeof x === 'string') : []; if (!title) { sendJson(res, 422, errorBody('title is required')); return; } if (labels.some((name) => !repo.labels.has(name))) { sendJson(res, 422, errorBody('label does not exist')); return; } const issue: Issue = { id: nextIssueId++, number: nextIssueNumber++, title, body: typeof body.body === 'string' ? body.body : '', state: 'open', labels, created: logicalTime++, comments: [] }; repo.issues.set(issue.number, issue); sendJson(res, 201, issueJson(repo, issue, base)); } catch (err) { sendJson(res, 400, errorBody((err as Error).message)); } return;
+      try { const body = await jsonBody(req); const title = typeof body.title === 'string' ? body.title : ''; const labels = Array.isArray(body.labels) ? body.labels.map((x) => typeof x === 'string' ? x : (x as Record<string, unknown>)?.name).filter((x): x is string => typeof x === 'string') : []; if (!title) { sendJson(res, 422, errorBody('title is required')); return; } if (labels.some((name) => !repo.labels.has(name))) { sendJson(res, 422, errorBody('label does not exist')); return; } const issue: Issue = { id: nextIssueId++, number: nextIssueNumber++, title, body: typeof body.body === 'string' ? body.body : '', state: 'open', labels, created: logicalTime++, comments: [], version: 0 }; repo.issues.set(issue.number, issue); sendJson(res, 201, issueCreateJson(repo, issue)); } catch (err) { sendJson(res, 400, errorBody((err as Error).message)); } return;
     }
     if (tail.length === 1 && req.method === 'GET') { const state = url.searchParams.get('state') || 'open'; let values = [...repo.issues.values()].filter((i) => state === 'all' || i.state === state); const direction = (url.searchParams.get('direction') || 'desc').toLowerCase(); values.sort((a, b) => direction === 'asc' ? a.created - b.created : b.created - a.created); sendJson(res, 200, values.map((i) => issueJson(repo, i, base))); return; }
     const number = Number(tail[1]); const issue = repo.issues.get(number); if (!issue) { notFound(res); return; }
     if (tail[2] === 'comments') {
       if (req.method === 'GET') { sendJson(res, 200, issue.comments.map((c) => ({ id: c.id, node_id: globalId('C', c.id), body: c.body, user: { login: VIEWER } }))); return; }
-      if (req.method === 'POST') { try { const body = await jsonBody(req); const comment = { id: nextCommentId++, body: typeof body.body === 'string' ? body.body : '' }; issue.comments.push(comment); sendJson(res, 201, { id: comment.id, node_id: globalId('C', comment.id), body: comment.body, user: { login: VIEWER } }); } catch (err) { sendJson(res, 400, errorBody((err as Error).message)); } return; }
+      if (req.method === 'POST') { try { const body = await jsonBody(req); const comment = { id: nextCommentId++, body: typeof body.body === 'string' ? body.body : '' }; issue.comments.push(comment); issue.version += 1; sendJson(res, 201, { id: comment.id, node_id: globalId('C', comment.id), body: comment.body, user: { login: VIEWER } }); } catch (err) { sendJson(res, 400, errorBody((err as Error).message)); } return; }
     }
-    if (req.method === 'GET') { sendJson(res, 200, issueJson(repo, issue, base)); return; }
-    if (req.method === 'PATCH') { try { const body = await jsonBody(req); if (typeof body.title === 'string') issue.title = body.title; if (typeof body.body === 'string') issue.body = body.body; if (body.state === 'open' || body.state === 'closed') issue.state = body.state; sendJson(res, 200, issueJson(repo, issue, base)); } catch (err) { sendJson(res, 400, errorBody((err as Error).message)); } return; }
+    if (req.method === 'GET') { sendJsonBytes(res, 200, issueJsonBytes(repo, issue, base)); return; }
+    if (req.method === 'PATCH') { try { const body = await jsonBody(req); if (typeof body.title === 'string') issue.title = body.title; if (typeof body.body === 'string') issue.body = body.body; if (body.state === 'open' || body.state === 'closed') issue.state = body.state; issue.version += 1; sendJsonBytes(res, 200, issueJsonBytes(repo, issue, base)); } catch (err) { sendJson(res, 400, errorBody((err as Error).message)); } return; }
   }
   if (tail[0] === 'pulls') {
     if (tail.length === 1 && req.method === 'GET') { const state = url.searchParams.get('state') || 'open'; sendJson(res, 200, [...repo.pulls.values()].filter((p) => state === 'all' || p.state === state).sort((a, b) => a.number - b.number).map((p) => pullJson(repo, p, base))); return; }
@@ -438,7 +500,10 @@ async function rest(req: IncomingMessage, res: ServerResponse, url: URL): Promis
 }
 
 function graphRepo(repo: Repo, vars: Record<string, unknown>): Record<string, unknown> {
-  const first = Math.max(1, Number(vars.first || 50) || 50); const issueValues = [...repo.issues.values()].filter((i) => i.state === 'open').sort((a, b) => b.created - a.created);
+  const first = Math.max(1, Number(vars.first || 50) || 50);
+  const issueValues = [...repo.issues.values()]
+    .filter((i) => i.state === 'open')
+    .sort((a, b) => b.created - a.created || b.number - a.number);
   const after = typeof vars.after === 'string' ? Number(vars.after.replace(/\D/g, '')) || 0 : 0; const selectedIssues = issueValues.slice(after, after + first); const selectedPulls = [...repo.pulls.values()].slice(0, first);
   const issue = repo.issues.get(Number(vars.number || 0)); const pull = repo.pulls.get(Number(vars.number || 0));
   return {
@@ -465,11 +530,11 @@ function graphqlOne(query: string, vars: Record<string, unknown>): Record<string
   if (query.includes('createIssue')) {
     const input = (vars.input || {}) as Record<string, unknown>; const repo = repoByGlobal(input.repositoryId);
     if (!repo || typeof input.title !== 'string') return { errors: [{ message: 'Invalid createIssue input' }] };
-    const issue: Issue = { id: nextIssueId++, number: nextIssueNumber++, title: input.title, body: typeof input.body === 'string' ? input.body : '', state: 'open', labels: [], created: logicalTime++, comments: [] }; repo.issues.set(issue.number, issue);
+    const issue: Issue = { id: nextIssueId++, number: nextIssueNumber++, title: input.title, body: typeof input.body === 'string' ? input.body : '', state: 'open', labels: [], created: logicalTime++, comments: [], version: 0 }; repo.issues.set(issue.number, issue);
     return { data: { createIssue: { issue: { id: globalId('I', issue.id), number: issue.number, title: issue.title, state: 'OPEN', body: issue.body } } } };
   }
   if (query.includes('closeIssue')) {
-    const found = issueByGlobal(((vars.input || {}) as Record<string, unknown>).issueId); if (!found) return { errors: [{ message: 'Issue not found' }] }; found.issue.state = 'closed';
+    const found = issueByGlobal(((vars.input || {}) as Record<string, unknown>).issueId); if (!found) return { errors: [{ message: 'Issue not found' }] }; found.issue.state = 'closed'; found.issue.version += 1;
     return { data: { closeIssue: { issue: { id: globalId('I', found.issue.id), number: found.issue.number, state: 'CLOSED' } } } };
   }
   if (query.includes('createPullRequest')) {
@@ -485,7 +550,7 @@ function graphqlOne(query: string, vars: Record<string, unknown>): Record<string
   }
   if (query.includes('addComment')) {
     const input = (vars.input || {}) as Record<string, unknown>; const foundIssue = issueByGlobal(input.subjectId); const body = typeof input.body === 'string' ? input.body : '';
-    if (foundIssue) { const comment = { id: nextCommentId++, body }; foundIssue.issue.comments.push(comment); return { data: { addComment: { commentEdge: { node: { id: globalId('C', comment.id), body } } } } }; }
+    if (foundIssue) { const comment = { id: nextCommentId++, body }; foundIssue.issue.comments.push(comment); foundIssue.issue.version += 1; return { data: { addComment: { commentEdge: { node: { id: globalId('C', comment.id), body } } } } }; }
     return { errors: [{ message: 'Subject not found' }] };
   }
   if (query.includes('node(')) { const repo = repoByGlobal(vars.id); return { data: { node: repo ? { id: globalId('R', repo.id), name: repo.name, nameWithOwner: repo.owner + '/' + repo.name } : null } }; }
@@ -524,11 +589,11 @@ async function mcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
       let value: unknown;
       if (name === 'create_repo') { const created = repo || makeRepo(owner, nameArg, args); value = repoJson(created); }
       else if (name === 'get_repo') value = repo ? repoJson(repo) : { message: 'Not Found' };
-      else if (name === 'create_issue') { if (!repo) value = { message: 'Not Found' }; else { const issue: Issue = { id: nextIssueId++, number: nextIssueNumber++, title: String(args.title), body: typeof args.body === 'string' ? args.body : '', state: 'open', labels: [], created: logicalTime++, comments: [] }; repo.issues.set(issue.number, issue); value = issueJson(repo, issue); } }
+      else if (name === 'create_issue') { if (!repo) value = { message: 'Not Found' }; else { const issue: Issue = { id: nextIssueId++, number: nextIssueNumber++, title: String(args.title), body: typeof args.body === 'string' ? args.body : '', state: 'open', labels: [], created: logicalTime++, comments: [], version: 0 }; repo.issues.set(issue.number, issue); value = issueJson(repo, issue); } }
       else if (name === 'list_issues') value = repo ? [...repo.issues.values()].filter((i) => !args.state || args.state === 'all' || i.state === args.state).map((i) => issueJson(repo, i)) : [];
       else if (name === 'create_pull_request') { if (!repo) value = { message: 'Not Found' }; else { const head = String(args.head); const base = String(args.base); const pull: Pull = { id: nextPullId++, number: nextPullNumber++, title: String(args.title), body: typeof args.body === 'string' ? args.body : '', head, base, state: 'open', merged: false, headFiles: fileMapAt(repo, head), baseFiles: fileMapAt(repo, base) }; repo.pulls.set(pull.number, pull); value = pullJson(repo, pull); } }
       else if (name === 'merge_pull_request') { const pull = repo ? repo.pulls.get(Number(args.pull_number)) : undefined; if (!repo || !pull) value = { message: 'Not Found' }; else { if (!pull.merged) { const sha = createCommit(repo, pull.base, cloneFiles(fileMapAt(repo, pull.head)), 'Merge pull request #' + pull.number, repoTip(repo, pull.base)); pull.merged = true; pull.state = 'closed'; pull.mergeSha = sha; pull.mergedAt = new Date(logicalTime++ * 1000).toISOString(); } value = { merged: true, sha: pull.mergeSha, message: 'Pull Request successfully merged' }; } }
-      else { const issue = repo?.issues.get(Number(args.issue_number)); if (!repo || !issue) value = { message: 'Not Found' }; else { const comment = { id: nextCommentId++, body: String(args.body) }; issue.comments.push(comment); value = comment; } }
+      else { const issue = repo?.issues.get(Number(args.issue_number)); if (!repo || !issue) value = { message: 'Not Found' }; else { const comment = { id: nextCommentId++, body: String(args.body) }; issue.comments.push(comment); issue.version += 1; value = comment; } }
       return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value } };
     }
     return { jsonrpc: '2.0', id, error: { code: -32601, message: 'Method not found' } };
@@ -545,8 +610,14 @@ async function git(req: IncomingMessage, res: ServerResponse, url: URL): Promise
   if (req.method === 'GET' && bits.slice(2).join('/') === 'info/refs' && service) {
     const version2 = req.headers['git-protocol'] === 'version=2' && service === 'git-upload-pack';
     const type = 'application/x-' + service + '-advertisement';
+    const advertisementKey = service + ':' + (version2 ? 'v2' : 'v0');
+    const cachedAdvertisement = repo.advertisementCache.get(advertisementKey);
+    if (cachedAdvertisement) { sendRaw(res, 200, cachedAdvertisement, type); return; }
     const caps = service === 'git-upload-pack' ? 'multi_ack_detailed side-band-64k thin-pack ofs-delta shallow agent=makefun-forge/1.0 object-format=sha1 filter' : 'report-status-v2 report-status side-band-64k delete-refs ofs-delta agent=makefun-forge/1.0 object-format=sha1';
-    if (version2) { sendRaw(res, 200, pktLines(['# service=' + service + '\n', 'flush', 'version 2\n', 'agent=makefun-forge/1.0\n', 'object-format=sha1\n', 'ls-refs=unborn\n', 'fetch=shallow filter\n', 'flush']), type); return; }
+    if (version2) {
+      const body = pktLines(['# service=' + service + '\n', 'flush', 'version 2\n', 'agent=makefun-forge/1.0\n', 'object-format=sha1\n', 'ls-refs=unborn\n', 'fetch=shallow filter\n', 'flush']);
+      repo.advertisementCache.set(advertisementKey, body); sendRaw(res, 200, body, type); return;
+    }
     const lines: Array<Buffer | string | 'flush'> = ['# service=' + service + '\n', 'flush'];
     const heads = [...repo.refs].filter(([ref]) => ref.startsWith('refs/heads/')); const advertised = [...repo.refs].filter(([ref]) => ref.startsWith('refs/heads/') || ref.startsWith('refs/tags/')); const head = repoTip(repo);
     if (!heads.length) lines.push(ZERO + ' HEAD\0' + caps + '\n');
@@ -557,35 +628,49 @@ async function git(req: IncomingMessage, res: ServerResponse, url: URL): Promise
       const target = object?.type === 'tag' ? object.data.toString('utf8').match(/^object ([0-9a-f]{40})/m)?.[1] : undefined;
       if (target) lines.push(target + ' ' + ref + '^{}\n');
     }
-    lines.push('flush'); sendRaw(res, 200, pktLines(lines), type); return;
+    lines.push('flush'); const body = pktLines(lines); repo.advertisementCache.set(advertisementKey, body); sendRaw(res, 200, body, type); return;
   }
   if (req.method !== 'POST') { notFound(res); return; }
   const body = await readBody(req); const isV2 = service === 'git-upload-pack' && req.headers['git-protocol'] === 'version=2';
   if (service === 'git-upload-pack') {
     const parsed = parsePktBody(body); const text = parsed.lines.map((x) => x.toString('utf8')).join('');
     if (isV2 && text.includes('command=ls-refs')) {
-      const lines: Array<Buffer | string | 'flush'> = []; const prefixes = [...text.matchAll(/ref-prefix ([^\n]+)/g)].map((m) => m[1]!.trim()); const include = (ref: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => ref.startsWith(prefix));
+      const lines: Array<Buffer | string | 'flush'> = [];
+      const prefixes = [...text.matchAll(/ref-prefix ([^\n]+)/g)].map((m) => m[1]!.trim());
+      const include = (ref: string): boolean => prefixes.length === 0 || prefixes.some((prefix) => ref.startsWith(prefix));
+      const lsRefsKey = JSON.stringify({ prefixes, peel: text.includes('peel\n') });
+      const cachedLsRefs = repo.lsRefsCache.get(lsRefsKey);
+      if (cachedLsRefs) { sendRaw(res, 200, cachedLsRefs, 'application/x-git-upload-pack-result'); return; }
       if (prefixes.length === 0 && repo.refs.size) lines.push(repoTip(repo) + ' HEAD symref-target:refs/heads/' + repo.defaultBranch + '\n');
       for (const [ref, sha] of repo.refs) if (include(ref)) {
-        lines.push(sha + ' ' + ref + '\n');
-        const object = repo.objects.get(sha); const target = object?.type === 'tag' ? object.data.toString('utf8').match(/^object ([0-9a-f]{40})/m)?.[1] : undefined;
-        if (target && text.includes('peel\n')) lines[lines.length - 1] = sha + ' ' + ref + ' peeled:' + target + '\n';
+        const object = repo.objects.get(sha);
+        const target = object?.type === 'tag' ? object.data.toString('utf8').match(/^object ([0-9a-f]{40})/m)?.[1] : undefined;
+        const peel = text.includes('peel\n') && target ? ' peeled:' + target : '';
+        lines.push(sha + ' ' + ref + peel + '\n');
       }
-      lines.push('flush'); sendRaw(res, 200, pktLines(lines), 'application/x-git-upload-pack-result'); return;
+      lines.push('flush'); const body = pktLines(lines); repo.lsRefsCache.set(lsRefsKey, body); sendRaw(res, 200, body, 'application/x-git-upload-pack-result'); return;
     }
-    const wants = [...text.matchAll(/want ([0-9a-f]{40})/g)].map((m) => m[1]!); const haves = [...text.matchAll(/have ([0-9a-f]{40})/g)].map((m) => m[1]!); const depthMatch = text.match(/deepen (\d+)/); const depth = depthMatch ? Number(depthMatch[1]) : Infinity;
-    const haveObjects = new Set(reachable(repo, haves).map((object) => hashObject(object.type, object.data)));
-    const objects = reachable(repo, wants.length ? wants : [repoTip(repo)], depth || Infinity).filter((object) => !haveObjects.has(hashObject(object.type, object.data)));
-    const pack = objects.length ? makePack(objects) : Buffer.alloc(0);
+    const wants = [...text.matchAll(/want ([0-9a-f]{40})/g)].map((m) => m[1]!);
+    const haves = [...text.matchAll(/have ([0-9a-f]{40})/g)].map((m) => m[1]!);
+    const depthMatch = text.match(/deepen (\d+)/);
+    const requestedDepth = depthMatch ? Math.max(1, Number(depthMatch[1]) || 1) : Infinity;
+    const maxCommitDepth = requestedDepth === Infinity ? Infinity : requestedDepth - 1;
+    const shallow = [...text.matchAll(/shallow ([0-9a-f]{40})/g)].map((m) => m[1]!);
+    const pack = packForFetch(repo, wants.length ? wants : [repoTip(repo)], haves, maxCommitDepth, shallow);
     if (!isV2) {
       const response: Array<Buffer | string | 'flush'> = [];
-      if (depthMatch && wants.length) response.push('shallow ' + wants[0] + '\n');
+      if (depthMatch && wants.length) response.push('shallow ' + (shallowBoundary(repo, wants[0]!, requestedDepth) || wants[0]!) + '\n');
       response.push('NAK\n');
       if (pack.length) for (let at = 0; at < pack.length; at += 60000) response.push(Buffer.concat([Buffer.from([1]), pack.subarray(at, at + 60000)]));
       response.push('flush'); sendRaw(res, 200, pktLines(response), 'application/x-git-upload-pack-result'); return;
     }
     const response: Array<Buffer | string | 'flush'> = ['acknowledgments\n', 'NAK\n', 'flush'];
-    if (depthMatch && wants.length) response.push('shallow-info\n', 'shallow ' + wants[0] + '\n', 'flush');
+    if (depthMatch && wants.length) {
+      response.push('shallow-info\n');
+      for (const old of shallow) response.push('unshallow ' + old + '\n');
+      const boundary = shallowBoundary(repo, wants[0]!, requestedDepth) || wants[0]!;
+      response.push('shallow ' + boundary + '\n', 'flush');
+    }
     if (pack.length) { response.push('packfile\n'); for (let at = 0; at < pack.length; at += 60000) response.push(Buffer.concat([Buffer.from([1]), pack.subarray(at, at + 60000)])); response.push('flush'); }
     sendRaw(res, 200, pktLines(response), 'application/x-git-upload-pack-result'); return;
   }
@@ -601,9 +686,8 @@ async function git(req: IncomingMessage, res: ServerResponse, url: URL): Promise
         if (command.next === ZERO) repo.refs.delete(command.ref);
         else {
           repo.refs.set(command.ref, command.next);
-          const branch = command.ref.startsWith('refs/heads/') ? command.ref.slice(11) : '';
-          if (branch) repo.files.set(branch, cloneFiles(hydrateFiles(repo, command.next)));
         }
+        repo.packCache.clear(); repo.advertisementCache.clear(); repo.lsRefsCache.clear();
       }
       return ok ? 'ok ' + command.ref + '\n' : 'ng ' + command.ref + ' ' + reason + '\n';
     });
@@ -614,7 +698,34 @@ async function git(req: IncomingMessage, res: ServerResponse, url: URL): Promise
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url || '/', 'http://entry'); const path = url.pathname;
+  const rawUrl = req.url || '/';
+  const rawPath = rawUrl.split('?', 1)[0] || '/';
+  if (req.method === 'GET' || req.method === 'POST') {
+    const fastIssue = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(rawPath);
+    if (req.method === 'GET' && fastIssue) {
+      if (!authorized(req)) { sendJson(res, 401, errorBody('Bad credentials')); return; }
+      const repo = repoFor(decodeURIComponent(fastIssue[1]!), decodeURIComponent(fastIssue[2]!));
+      const issue = repo?.issues.get(Number(fastIssue[3]));
+      if (!repo || repo.owner !== VIEWER || !issue) { notFound(res); return; }
+      sendJsonBytes(res, 200, issueJsonBytes(repo, issue, apiBase(req))); return;
+    }
+    const fastIssueCollection = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/.exec(rawPath);
+    if (req.method === 'POST' && fastIssueCollection) {
+      if (!authorized(req)) { sendJson(res, 401, errorBody('Bad credentials')); return; }
+      const repo = repoFor(decodeURIComponent(fastIssueCollection[1]!), decodeURIComponent(fastIssueCollection[2]!));
+      if (!repo || repo.owner !== VIEWER) { notFound(res); return; }
+      try {
+        const body = await jsonBody(req); const title = typeof body.title === 'string' ? body.title : '';
+        const labels = Array.isArray(body.labels) ? body.labels.map((x) => typeof x === 'string' ? x : (x as Record<string, unknown>)?.name).filter((x): x is string => typeof x === 'string') : [];
+        if (!title) { sendJson(res, 422, errorBody('title is required')); return; }
+        if (labels.some((name) => !repo.labels.has(name))) { sendJson(res, 422, errorBody('label does not exist')); return; }
+        const issue: Issue = { id: nextIssueId++, number: nextIssueNumber++, title, body: typeof body.body === 'string' ? body.body : '', state: 'open', labels, created: logicalTime++, comments: [], version: 0 };
+        repo.issues.set(issue.number, issue); sendJson(res, 201, issueCreateJson(repo, issue));
+      } catch (err) { sendJson(res, (err as { status?: number }).status || 400, errorBody((err as Error).message)); }
+      return;
+    }
+  }
+  const url = new URL(rawUrl, 'http://entry'); const path = url.pathname;
   if (req.method === 'GET' && path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
   if (path === '/mcp') { await mcp(req, res); return; }
   if (path === '/api/graphql') {
